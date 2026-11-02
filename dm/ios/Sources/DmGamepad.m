@@ -95,7 +95,15 @@ static void phone_motion_start(UIView *body) {
     if (!g_motion.deviceMotionAvailable) { LOG("front end: no device motion, the phone's gyro is not used"); return; }
     LOG("front end: the phone's gyro drives the controller's six-axis sensor %s", mode < 0 ? "while no controller supplies fresh motion" : "always (DM_PHONE_MOTION=1)");
     g_motion.deviceMotionUpdateInterval = 1.0 / 100;
-    if (@available(iOS 27.0, *)) { g_motion.deviceMotionBody = body; g_motion_body = YES; LOG("front end: the phone's motion comes in the pad view's frame (deviceMotionBody)"); }
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 270000
+    if (@available(iOS 27.0, *)) {
+        g_motion.deviceMotionBody = body;
+        g_motion_body = YES;
+        LOG("front end: the phone's motion comes in the pad view's frame (deviceMotionBody)");
+    }
+#else
+    (void)body;
+#endif
     NSOperationQueue *q = [NSOperationQueue new]; q.maxConcurrentOperationCount = 1;
     [g_motion startDeviceMotionUpdatesToQueue:q withHandler:^(CMDeviceMotion *d, NSError *err) {
         (void)err; if (!d) return;
@@ -129,13 +137,48 @@ static const CGFloat
     K_RSWIPE = 1.0 / 3,                             // right stick area: this fraction of the screen width from the right edge (not in u)
     K_CLICK_X = 102, K_CLICK_R = 17;                // L3 / R3: centre from the outer edge (level with ZL / ZR), radius
 static const int k_btns[] = {B_ZL, B_L, B_ZR, B_R, B_MINUS, B_PLUS, B_LS, B_RS};   // keys locked at touch-down (L3 / R3 only in the 3D layout)
-static NSString *const k_layout_key = @"DmPadLayout";   // NSUserDefaults: 0 = 2D, 1 = 3D, 2 = Tap (DM_GAME_PAD_LAYOUT's numbers)
+static NSString *const k_layout_key = @"DmPadLayout";
+static NSString *const k_editor_config_key = @"DmPadEditor.v2";   // NSUserDefaults: 0 = 2D, 1 = 3D, 2 = Tap (DM_GAME_PAD_LAYOUT's numbers)
 int dm_opmode(void);   // hle_oe.c: 0 = handheld
 
 @interface DmGamepad : UIView
 - (void)arrange:(DmLayout)layout;
 - (BOOL)menuTakes:(CGPoint)p;
+
+- (CGFloat)u;
+- (CGPoint)faceCenter;
+- (CGFloat)faceGap;
+- (CGFloat)faceR;
+- (CGPoint)stickHome;
+- (CGFloat)stickR:(int)i;
+- (CGPoint)dpadCenter;
+- (CGFloat)dpadR;
+- (CGPoint)dropCenter:(int)b;
+- (CGFloat)dropR:(int)b;
+- (CGPoint)clickCenter:(int)b;
+- (CGRect)pillRect:(int)b;
+- (CGPoint)swapCenter;
+- (void)reset;
+- (NSMutableDictionary *)editorOverrides;
+- (CGPoint)editorCenter:(CGPoint)base key:(NSString *)key;
+- (CGFloat)editorScale:(NSString *)key;
+- (void)saveEditorLayout;
+- (void)setEditorCenter:(CGPoint)p forKey:(NSString *)key;
+- (void)setEditorScale:(CGFloat)s forKey:(NSString *)key;
+- (CGFloat)clickR:(int)b;
+- (CGFloat)swapR;
+- (NSString *)dropEditorKey:(int)b;
+- (NSArray<NSDictionary *> *)editorItems;
+- (NSDictionary *)editorItemAt:(CGPoint)p;
+- (NSInteger)editorActionAt:(CGPoint)p;
+- (void)layoutEditorUI;
+- (void)setEditorMode:(BOOL)enabled;
+- (void)editorTouchesBegan:(NSSet<UITouch *> *)touches;
+- (void)editorTouchesMoved:(NSSet<UITouch *> *)touches;
+- (void)performEditorAction:(NSInteger)action;
+- (void)editorTouchesEnded:(NSSet<UITouch *> *)touches commit:(BOOL)commit;
 @end
+
 // The menu button: a UIButton whose menu is the in-game menu (UIKit draws it and takes the touches while it is open). Its hit circle is larger than the drawn one, and a key nearer
 // to the touch wins (− / + sit beside it), so it asks the pad
 @interface DmMenuButton : UIButton
@@ -143,6 +186,9 @@ int dm_opmode(void);   // hle_oe.c: 0 = handheld
 @implementation DmMenuButton
 - (BOOL)pointInside:(CGPoint)p withEvent:(UIEvent *)e { DmGamepad *pad = (DmGamepad *)self.superview; return [pad menuTakes:[self convertPoint:p toView:pad]]; }
 @end
+static CGPathRef circlePath(CGPoint c, CGFloat r);
+static void setPath(CAShapeLayer *l, CGPathRef p);
+
 static __weak DmGamepad *g_view;
 static void pads_start(void);   // Physical controllers, below
 
@@ -161,8 +207,21 @@ static void pads_start(void);   // Physical controllers, below
     BOOL _full, _tap;                              // the 3D layout / the Tap layout is current
     CALayer *_controls;                            // holds every control layer: hidden while a physical controller is connected (the view itself stays, for game touches)
     BOOL _padOff;                                  // a physical controller is connected: every touch goes to the game
-    DmLayout _layout;
-    UITouch *_game[16];                            // touches on the game's touch screen by finger slot
+DmLayout _layout;
+    UITouch *_game[16];                         // touches on the game's touch screen by finger slot
+
+    NSMutableDictionary *_layoutConfig;        // per-game, per-layout control positions and scales
+    BOOL _editMode;
+    UITouch *_editorTouch;
+    NSString *_selectedEditKey;
+    NSInteger _editorAction;
+    NSInteger _editorReturnLayout;              // restore 2D / 3D / Tap after leaving the editor
+    CGPoint _editorGrabOffset;
+    CGRect _editorToolbarRect, _editorActionRects[4];
+    CAShapeLayer *_editorPanel, *_editorSelection;
+    CATextLayer *_editorLabels[5];
+    UITouch *_swapTouch;
+    CFTimeInterval _swapBeganAt;
 }
 
 static UIColor *k_idle, *k_on, *k_line, *k_ringFill, *k_text, *k_textOn;
@@ -208,7 +267,23 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }   
             _key[b] = shape(_controls);
             if (names[b]) _label[b] = label(_key[b], names[b]);   // the D-pad arms carry no label
         }
-        _menu = [DmMenuButton buttonWithType:UIButtonTypeCustom];
+_swap = shape(_controls); _swapLabel = label(_swap, @"");
+        _editorPanel = [CAShapeLayer layer];
+        _editorPanel.fillColor = [UIColor colorWithWhite:0.04 alpha:0.88].CGColor;
+        _editorPanel.strokeColor = [UIColor colorWithWhite:1 alpha:0.42].CGColor;
+        _editorPanel.lineWidth = 1.0; [_controls addSublayer:_editorPanel];
+        _editorLabels[0] = label(_editorPanel, @"DRAG A CONTROL");
+        _editorLabels[1] = label(_editorPanel, @"SIZE −");
+        _editorLabels[2] = label(_editorPanel, @"SIZE +");
+        _editorLabels[3] = label(_editorPanel, @"RESET");
+        _editorLabels[4] = label(_editorPanel, @"DONE");
+        for (int i = 0; i < 5; i++) { _editorLabels[i].fontSize = 12; _editorLabels[i].alignmentMode = kCAAlignmentCenter; _editorLabels[i].foregroundColor = UIColor.whiteColor.CGColor; }
+        _editorSelection = [CAShapeLayer layer]; _editorSelection.fillColor = UIColor.clearColor.CGColor;
+        _editorSelection.strokeColor = [UIColor colorWithWhite:1 alpha:0.9].CGColor;
+        _editorSelection.lineWidth = 2.0; _editorSelection.lineDashPattern = @[@5, @4]; [_controls addSublayer:_editorSelection];
+        _editorPanel.hidden = _editorSelection.hidden = YES; _editorAction = -1;
+
+_menu = [DmMenuButton buttonWithType:UIButtonTypeCustom];
         _menu.backgroundColor = k_idle; _menu.layer.borderColor = k_line.CGColor; _menu.layer.borderWidth = 1.5;
         _menu.layer.shadowColor = UIColor.blackColor.CGColor; _menu.layer.shadowOpacity = 0.2; _menu.layer.shadowRadius = 3; _menu.layer.shadowOffset = CGSizeMake(0, 1);
         _menu.tintColor = k_text; _menu.accessibilityLabel = @"Menu";
@@ -220,6 +295,10 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }   
         int l = saved ? (int)saved.integerValue : DM_GAME_PAD_LAYOUT;
         if (l == 2 && dm_opmode() != 0) l = 0;   // Tap only in handheld mode (env.txt's DM_OPMODE may have changed it)
         _full = l == 1; _tap = l == 2;
+        _layoutConfig = [NSMutableDictionary dictionary];
+        NSDictionary *savedEditor = [NSUserDefaults.standardUserDefaults dictionaryForKey:k_editor_config_key];
+        for (NSString *slot in savedEditor) if ([savedEditor[slot] isKindOfClass:NSDictionary.class])
+            _layoutConfig[slot] = [savedEditor[slot] mutableCopy];
         [self applyLayout];
         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
         [nc addObserver:self selector:@selector(padsChanged:) name:GCControllerDidConnectNotification object:nil];
@@ -254,6 +333,195 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }   
     if (!_touchFeedback) { _touchFeedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight]; [_touchFeedback prepare]; }
 }
 
+// ---- In-game gamepad editor (long-press the 2D/3D button to enter) ----
+- (NSString *)editorLayoutSlot { return _full ? @"3D" : @"2D"; }
+- (NSMutableDictionary *)editorOverrides {
+    NSString *slot = [self editorLayoutSlot];
+    NSMutableDictionary *d = _layoutConfig[slot];
+    if (!d) { d = [NSMutableDictionary dictionary]; _layoutConfig[slot] = d; }
+    return d;
+}
+- (CGPoint)editorCenter:(CGPoint)base key:(NSString *)key {
+    NSArray *v = [self editorOverrides][key]; CGRect b = self.bounds;
+    if (![v isKindOfClass:NSArray.class] || v.count < 2 || b.size.width <= 0 || b.size.height <= 0) return base;
+    CGFloat x = [v[0] doubleValue] * b.size.width, y = [v[1] doubleValue] * b.size.height;
+    return CGPointMake(x, y);
+}
+- (CGFloat)editorScale:(NSString *)key {
+    NSArray *v = [self editorOverrides][key];
+    if (![v isKindOfClass:NSArray.class] || v.count < 3) return 1.0;
+    return fmin(fmax([v[2] doubleValue], 0.65), 1.50);
+}
+- (void)saveEditorLayout {
+    [NSUserDefaults.standardUserDefaults setObject:_layoutConfig forKey:k_editor_config_key];
+}
+- (void)setEditorCenter:(CGPoint)p forKey:(NSString *)key {
+    CGRect b = self.bounds; CGFloat u = self.u;
+    if (b.size.width <= 0 || b.size.height <= 0) return;
+    p.x = fmin(fmax(p.x, 12 * u), b.size.width - 12 * u);
+    p.y = fmin(fmax(p.y, 12 * u), b.size.height - 12 * u);
+    NSMutableArray *v = [[self editorOverrides][key] mutableCopy];
+    if (!v) v = [NSMutableArray arrayWithObjects:@(p.x / b.size.width), @(p.y / b.size.height), @1.0, nil];
+    else {
+        while (v.count < 3) [v addObject:@1.0];
+        v[0] = @(p.x / b.size.width); v[1] = @(p.y / b.size.height);
+    }
+    [self editorOverrides][key] = v;
+}
+- (void)setEditorScale:(CGFloat)s forKey:(NSString *)key {
+    NSArray *old = [self editorOverrides][key];
+    NSMutableArray *v = old ? [old mutableCopy] : nil;
+    if (!v) {
+        CGRect b = self.bounds; CGPoint c = CGPointMake(b.size.width * 0.5, b.size.height * 0.5);
+        for (NSDictionary *item in [self editorItems]) if ([item[@"key"] isEqual:key]) { c = [item[@"center"] CGPointValue]; break; }
+        v = [NSMutableArray arrayWithObjects:@(b.size.width > 0 ? c.x / b.size.width : 0.5), @(b.size.height > 0 ? c.y / b.size.height : 0.5), @1.0, nil];
+    }
+    while (v.count < 3) [v addObject:@1.0];
+    v[2] = @(fmin(fmax(s, 0.65), 1.50));
+    [self editorOverrides][key] = v;
+}
+- (CGFloat)clickR:(int)b { return K_CLICK_R * self.u * [self editorScale:(b == B_RS ? @"clickRS" : @"clickLS")]; }
+- (CGFloat)swapR { return K_SWAP_R * self.u * [self editorScale:@"swap"]; }
+- (NSString *)dropEditorKey:(int)b {
+    switch (b) { case B_ZL: return @"dropZL"; case B_L: return @"dropL"; case B_ZR: return @"dropZR"; default: return @"dropR"; }
+}
+- (NSArray<NSDictionary *> *)editorItems {
+    CGFloat u = self.u; NSMutableArray *a = [NSMutableArray array];
+    for (NSNumber *n in @[@(B_ZL), @(B_L), @(B_ZR), @(B_R)]) {
+        int b = n.intValue; NSString *key = [self dropEditorKey:b];
+        NSString *name = b == B_ZL ? @"ZL" : b == B_L ? @"L" : b == B_ZR ? @"ZR" : @"R";
+        [a addObject:@{@"key":key, @"name":name, @"center":[NSValue valueWithCGPoint:[self dropCenter:b]], @"radius":@([self dropR:b] * 1.55)}];
+    }
+    if (_full) {
+        for (NSNumber *n in @[@(B_LS), @(B_RS)]) {
+            int b = n.intValue; NSString *key = b == B_LS ? @"clickLS" : @"clickRS";
+            [a addObject:@{@"key":key, @"name":b == B_LS ? @"L3" : @"R3", @"center":[NSValue valueWithCGPoint:[self clickCenter:b]], @"radius":@([self clickR:b] * 1.7)}];
+        }
+    }
+    for (NSNumber *n in @[@(B_MINUS), @(B_PLUS)]) {
+        int b = n.intValue; NSString *key = b == B_PLUS ? @"plus" : @"minus";
+        CGRect r = [self pillRect:b]; CGPoint c = CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r));
+        [a addObject:@{@"key":key, @"name":b == B_PLUS ? @"+" : @"−", @"center":[NSValue valueWithCGPoint:c], @"radius":@(MAX(r.size.width, r.size.height) * 0.8 + 12 * u)}];
+    }
+    [a addObject:@{@"key":@"swap", @"name":@"2D / 3D", @"center":[NSValue valueWithCGPoint:self.swapCenter], @"radius":@(self.swapR * 1.8)}];
+    [a addObject:@{@"key":@"face", @"name":@"ABXY", @"center":[NSValue valueWithCGPoint:self.faceCenter], @"radius":@(self.faceGap + self.faceR * 1.8)}];
+    [a addObject:@{@"key":@"stickL", @"name":@"LEFT STICK", @"center":[NSValue valueWithCGPoint:self.stickHome], @"radius":@([self stickR:0] * 1.25)}];
+    if (_full) [a addObject:@{@"key":@"dpad", @"name":@"D-PAD", @"center":[NSValue valueWithCGPoint:self.dpadCenter], @"radius":@(self.dpadR * 1.4)}];
+    return a;
+}
+- (NSDictionary *)editorItemAt:(CGPoint)p {
+    NSDictionary *best = nil; CGFloat score = 1.35;
+    for (NSDictionary *item in [self editorItems]) {
+        CGPoint c = [item[@"center"] CGPointValue]; CGFloat r = MAX([item[@"radius"] doubleValue], 1);
+        CGFloat q = hypot(p.x - c.x, p.y - c.y) / r;
+        if (q < score) { score = q; best = item; }
+    }
+    return best;
+}
+- (NSInteger)editorActionAt:(CGPoint)p {
+    for (NSInteger i = 0; i < 4; i++) if (CGRectContainsPoint(_editorActionRects[i], p)) return i;
+    return -1;
+}
+- (void)layoutEditorUI {
+    if (!_editMode || _padOff || self.bounds.size.width <= 0 || self.bounds.size.height <= 0) {
+        _editorPanel.hidden = YES; _editorSelection.hidden = YES; return;
+    }
+    _editorPanel.hidden = NO; _editorPanel.frame = self.bounds;
+    CGFloat w = MIN(372.0, self.bounds.size.width - 20.0), h = 42.0;
+    CGFloat x = (self.bounds.size.width - w) * 0.5;
+    CGRect safe = self.safe;
+    CGFloat y = CGRectGetMaxY(safe) - h - 8.0;
+    y = MAX(CGRectGetMinY(safe) + 8.0, y);
+    _editorToolbarRect = CGRectMake(x, y, w, h);
+    setPath(_editorPanel, CGPathCreateWithRoundedRect(_editorToolbarRect, 11, 11, NULL));
+    CGFloat infoW = w * 0.34, bw = (w - infoW) / 4.0;
+    _editorLabels[0].string = _selectedEditKey ? @"Selected control" : @"DRAG A CONTROL";
+    static NSString *const names[4] = {@"SIZE −", @"SIZE +", @"RESET", @"DONE"};
+    for (NSInteger i = 0; i < 4; i++) {
+        _editorActionRects[i] = CGRectMake(x + infoW + i * bw, y, bw, h);
+        _editorLabels[i + 1].string = names[i];
+        _editorLabels[i + 1].frame = CGRectMake(x + infoW + i * bw, y, bw, h);
+    }
+    _editorLabels[0].frame = CGRectMake(x + 8, y, infoW - 12, h);
+    if (_selectedEditKey) {
+        for (NSDictionary *item in [self editorItems]) if ([item[@"key"] isEqual:_selectedEditKey]) {
+            _editorLabels[0].string = [NSString stringWithFormat:@"%@ selected", item[@"name"]]; break;
+        }
+    }
+    _editorSelection.hidden = (_selectedEditKey == nil); _editorSelection.frame = self.bounds;
+    if (_selectedEditKey) {
+        for (NSDictionary *item in [self editorItems]) if ([item[@"key"] isEqual:_selectedEditKey]) {
+            CGPoint c = [item[@"center"] CGPointValue]; CGFloat r = MAX(26 * self.u, [item[@"radius"] doubleValue] * 0.72);
+            setPath(_editorSelection, circlePath(c, r)); break;
+        }
+    }
+}
+- (void)setEditorMode:(BOOL)enabled {
+    if (enabled && _padOff) return;
+    if (_editMode == enabled) return;
+    [self reset];
+    if (enabled) {
+        _editorReturnLayout = _tap ? 2 : _full ? 1 : 0;
+        if (_tap) {
+            _tap = NO; _full = NO;       // show the 2D controls while editing a Tap layout
+            [self applyLayout];
+        }
+    } else {
+        [self saveEditorLayout];
+        if (_editorReturnLayout == 2) {
+            _full = NO; _tap = YES;
+            [NSUserDefaults.standardUserDefaults setObject:@2 forKey:k_layout_key];
+            [self applyLayout];
+        }
+        _editorReturnLayout = -1;
+    }
+    _editMode = enabled; _selectedEditKey = nil; _editorTouch = nil; _editorAction = -1;
+    [self setNeedsLayout]; [self layoutIfNeeded];
+}
+- (void)editorTouchesBegan:(NSSet<UITouch *> *)touches {
+    for (UITouch *t in touches) {
+        if (_editorTouch) continue;
+        CGPoint p = [t locationInView:self];
+        if (CGRectContainsPoint(_editorToolbarRect, p)) {
+            _editorTouch = t; _editorAction = [self editorActionAt:p];
+            if (_editorAction < 0) _editorAction = -2; // the selected-control title is informational
+            return;
+        }
+        NSDictionary *item = [self editorItemAt:p];
+        if (!item) { _selectedEditKey = nil; [self setNeedsLayout]; return; }
+        _selectedEditKey = item[@"key"];
+        CGPoint c = [item[@"center"] CGPointValue];
+        _editorGrabOffset = CGPointMake(c.x - p.x, c.y - p.y);
+        _editorTouch = t; _editorAction = -1;
+        [self setNeedsLayout]; [self layoutIfNeeded];
+        return;
+    }
+}
+- (void)editorTouchesMoved:(NSSet<UITouch *> *)touches {
+    for (UITouch *t in touches) if (t == _editorTouch && _editorAction == -1 && _selectedEditKey) {
+        CGPoint p = [t locationInView:self];
+        [self setEditorCenter:CGPointMake(p.x + _editorGrabOffset.x, p.y + _editorGrabOffset.y) forKey:_selectedEditKey];
+        [self setNeedsLayout]; [self layoutIfNeeded];
+    }
+}
+- (void)performEditorAction:(NSInteger)action {
+    if (action == 0 && _selectedEditKey) [self setEditorScale:[self editorScale:_selectedEditKey] - 0.05 forKey:_selectedEditKey];
+    else if (action == 1 && _selectedEditKey) [self setEditorScale:[self editorScale:_selectedEditKey] + 0.05 forKey:_selectedEditKey];
+    else if (action == 2) { [[self editorOverrides] removeAllObjects]; _selectedEditKey = nil; }
+    else if (action == 3) { [self setEditorMode:NO]; return; }
+    [self saveEditorLayout]; [self setNeedsLayout]; [self layoutIfNeeded];
+}
+- (void)editorTouchesEnded:(NSSet<UITouch *> *)touches commit:(BOOL)commit {
+    for (UITouch *t in touches) if (t == _editorTouch) {
+        CGPoint p = [t locationInView:self];
+        if (commit && _editorAction >= 0 && [self editorActionAt:p] == _editorAction) [self performEditorAction:_editorAction];
+        else if (_editorAction == -1) [self saveEditorLayout];
+        _editorTouch = nil; _editorAction = -1;
+        [self setNeedsLayout];
+        return;
+    }
+}
+
 // ---- Layout (points; computed inside the safe area) ----
 - (void)arrange:(DmLayout)layout {
     if (CGRectEqualToRect(_layout.controls, layout.controls) && CGRectEqualToRect(_layout.game, layout.game) && _layout.separated == layout.separated && _layout.topSafeOnly == layout.topSafeOnly) return;
@@ -265,55 +533,180 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }   
 - (CGRect)corner { if (_layout.separated) return self.safe; UIEdgeInsets i = self.safeAreaInsets; i.left *= K_CORNER_IN; i.right *= K_CORNER_IN; return UIEdgeInsetsInsetRect(self.bounds, i); }   // the rectangle the bottom-corner controls use
 - (CGFloat)u { if (_layout.separated) { CGRect s = self.safe; return MIN(MIN(s.size.height / 430.0, s.size.width / 700.0), 1.3); } return MIN(self.bounds.size.height / 430.0, 1.3); }   // 1 = 430 points tall (iPhone Pro Max landscape)
 static CGPoint side(CGRect s, int right, CGFloat dx, CGFloat y) { return CGPointMake(right ? CGRectGetMaxX(s) - dx : CGRectGetMinX(s) + dx, y); }
-- (BOOL)portraitControls { return _layout.separated && self.bounds.size.height > self.bounds.size.width; }
+- (BOOL)portraitControls {
+    return _layout.separated && self.bounds.size.height > self.bounds.size.width;
+}
+
 - (CGPoint)portraitThumbCenter:(BOOL)right {
     CGRect s = self.safe;
     return CGPointMake(CGRectGetMinX(s) + s.size.width * (right ? 0.72 : 0.28),
                        CGRectGetMinY(s) + s.size.height * 0.58);
 }
-- (CGPoint)faceCenter { CGRect s = self.corner; CGFloat u = self.u;
-    if (self.portraitControls) return [self portraitThumbCenter:YES];
-    CGFloat edge = _layout.separated ? self.faceGap + self.faceHitR : 0;
-    return side(s, 1, MAX(K_FACE_X * u, edge), CGRectGetMaxY(s) - MAX(K_PAD_Y * u, edge)); }
-- (CGFloat)faceGap { return K_FACE_GAP * self.u; }
-- (CGFloat)faceR { return K_FACE_R * self.u; }
-- (CGFloat)faceHitR { return MAX(self.faceR * 1.25, _layout.separated ? 22 : 0); }
-- (CGPoint)facePos:(int)b { CGPoint c = self.faceCenter; CGFloat g = self.faceGap;
-    switch (b) { case B_A: return CGPointMake(c.x + g, c.y); case B_B: return CGPointMake(c.x, c.y + g); case B_X: return CGPointMake(c.x, c.y - g); default: return CGPointMake(c.x - g, c.y); } }
-- (CGPoint)stickHome {
-    if (self.portraitControls) {
-        CGPoint p = [self portraitThumbCenter:NO];
-        if (_full) p.x -= self.dpadR + 6 * self.u;
-        return p;
-    }
+
+- (CGPoint)faceCenter {
     CGRect s = self.corner;
-    return side(s, 0, K_STICK_X * self.u, CGRectGetMaxY(s) - K_PAD_Y * self.u);
-}
-- (CGPoint)stickCentre:(int)i { return i ? _rCentre : self.stickHome; }
-- (CGFloat)stickR:(int)i { return (i ? K_RSTICK_R : K_STICK_R) * self.u; }
-- (BOOL)inRightArea:(CGPoint)p { CGRect b = _layout.controls; return p.x >= CGRectGetMaxX(b) - b.size.width * K_RSWIPE; }
-- (CGPoint)dpadCenter {
+    CGFloat u = self.u;
+    CGPoint p;
+
     if (self.portraitControls) {
-        CGPoint p = [self portraitThumbCenter:NO];
-        p.x += [self stickR:0] + 6 * self.u;
-        return p;
+        p = [self portraitThumbCenter:YES];
+    } else {
+        CGFloat edge = _layout.separated ? self.faceGap + self.faceHitR : 0;
+        p = side(s, 1, MAX(K_FACE_X * u, edge),
+                 CGRectGetMaxY(s) - MAX(K_PAD_Y * u, edge));
     }
-    CGRect s = self.corner; CGFloat u = self.u;
-    return side(s, 0, K_LOW_X * u, CGRectGetMaxY(s) - K_LOW_Y * u);
+
+    return [self editorCenter:p key:@"face"];
 }
-- (CGFloat)dpadR { return K_DPAD_R * self.u; }
-static BOOL isDrop(int b) { return b == B_ZL || b == B_L || b == B_ZR || b == B_R; }
-static BOOL isClick(int b) { return b == B_LS || b == B_RS; }
-- (CGPoint)dropCenter:(int)b { CGRect s = self.safe; CGFloat u = self.u; BOOL z = b == B_ZL || b == B_ZR;
+
+- (CGFloat)faceGap {
+    return K_FACE_GAP * self.u * [self editorScale:@"face"];
+}
+
+- (CGFloat)faceR {
+    return K_FACE_R * self.u * [self editorScale:@"face"];
+}
+
+- (CGFloat)faceHitR {
+    return MAX(self.faceR * 1.25, _layout.separated ? 22 : 0);
+}
+
+- (CGPoint)facePos:(int)b {
+    CGPoint c = self.faceCenter;
+    CGFloat g = self.faceGap;
+
+    switch (b) {
+        case B_A: return CGPointMake(c.x + g, c.y);
+        case B_B: return CGPointMake(c.x, c.y + g);
+        case B_X: return CGPointMake(c.x, c.y - g);
+        default: return CGPointMake(c.x - g, c.y);
+    }
+}
+
+- (CGPoint)stickHome {
+    CGFloat u = self.u;
+    CGPoint p;
+
+    if (self.portraitControls) {
+        p = [self portraitThumbCenter:NO];
+        if (_full) p.x -= self.dpadR + 6 * u;
+    } else {
+        CGRect s = self.corner;
+        p = side(s, 0, K_STICK_X * u, CGRectGetMaxY(s) - K_PAD_Y * u);
+    }
+
+    return [self editorCenter:p key:@"stickL"];
+}
+
+- (CGPoint)stickCentre:(int)i {
+    return i ? _rCentre : self.stickHome;
+}
+
+- (CGFloat)stickR:(int)i {
+    return (i ? K_RSTICK_R : K_STICK_R * [self editorScale:@"stickL"]) * self.u;
+}
+
+- (BOOL)inRightArea:(CGPoint)p {
+    CGRect b = _layout.controls;
+    return p.x >= CGRectGetMaxX(b) - b.size.width * K_RSWIPE;
+}
+
+- (CGPoint)dpadCenter {
+    CGFloat u = self.u;
+    CGPoint p;
+
+    if (self.portraitControls) {
+        p = [self portraitThumbCenter:NO];
+        p.x += [self stickR:0] + 6 * u;
+    } else {
+        CGRect s = self.corner;
+        p = side(s, 0, K_LOW_X * u, CGRectGetMaxY(s) - K_LOW_Y * u);
+    }
+
+    return [self editorCenter:p key:@"dpad"];
+}
+
+- (CGFloat)dpadR {
+    return K_DPAD_R * self.u * [self editorScale:@"dpad"];
+}
+
+static BOOL isDrop(int b) {
+    return b == B_ZL || b == B_L || b == B_ZR || b == B_R;
+}
+
+static BOOL isClick(int b) {
+    return b == B_LS || b == B_RS;
+}
+
+- (CGPoint)dropCenter:(int)b {
+    CGRect s = self.safe;
+    CGFloat u = self.u;
+    BOOL z = b == B_ZL || b == B_ZR;
     CGFloat edge = _layout.separated ? 22 : 0;
-    return side(s, b == B_ZR || b == B_R, MAX((z ? K_ZL_X : K_L_X) * u, edge), CGRectGetMinY(s) + MAX((z ? K_ZL_Y : K_L_Y) * u, edge)); }
-- (CGFloat)dropR:(int)b { return (b == B_ZL || b == B_ZR ? K_ZL_R : K_L_R) * self.u; }
-- (CGPoint)clickCenter:(int)b { CGRect s = self.safe; CGFloat u = self.u; CGFloat edge = _layout.separated ? 22 : 0;
-    return side(s, b == B_RS, MAX(K_CLICK_X * u, edge), CGRectGetMinY(s) + MAX(K_ZL_Y * u, edge)); }
-- (CGRect)pillRect:(int)b { CGRect s = self.safe; CGFloat u = self.u, w = K_PILL_W * u, h = K_PILL_H * u;
-    CGPoint c = CGPointMake(CGRectGetMidX(s) + (b == B_PLUS ? K_PILL_DX : -K_PILL_DX) * u, CGRectGetMinY(s) + MAX(K_PILL_Y * u, _layout.separated ? 14 : 0));   // − on the left, + on the right
-    return CGRectMake(c.x - w / 2, c.y - h / 2, w, h); }
-- (CGPoint)menuCenter { CGRect s = self.safe; return CGPointMake(CGRectGetMidX(s), CGRectGetMinY(s) + MAX(K_PILL_Y * self.u, _layout.separated ? 14 : 0)); }
+
+    CGPoint p = side(
+        s,
+        b == B_ZR || b == B_R,
+        MAX((z ? K_ZL_X : K_L_X) * u, edge),
+        CGRectGetMinY(s) + MAX((z ? K_ZL_Y : K_L_Y) * u, edge)
+    );
+
+    return [self editorCenter:p key:[self dropEditorKey:b]];
+}
+
+- (CGFloat)dropR:(int)b {
+    return (b == B_ZL || b == B_ZR ? K_ZL_R : K_L_R)
+        * self.u * [self editorScale:[self dropEditorKey:b]];
+}
+
+- (CGPoint)clickCenter:(int)b {
+    CGRect s = self.safe;
+    CGFloat u = self.u;
+    CGFloat edge = _layout.separated ? 22 : 0;
+
+    CGPoint p = side(
+        s,
+        b == B_RS,
+        MAX(K_CLICK_X * u, edge),
+        CGRectGetMinY(s) + MAX(K_ZL_Y * u, edge)
+    );
+
+    return [self editorCenter:p key:(b == B_RS ? @"clickRS" : @"clickLS")];
+}
+
+- (CGRect)pillRect:(int)b {
+    CGRect s = self.safe;
+    CGFloat u = self.u;
+    NSString *key = b == B_PLUS ? @"plus" : @"minus";
+    CGFloat scale = [self editorScale:key];
+    CGFloat w = K_PILL_W * u * scale;
+    CGFloat h = K_PILL_H * u * scale;
+
+    CGPoint c = CGPointMake(
+        CGRectGetMidX(s) + (b == B_PLUS ? K_PILL_DX : -K_PILL_DX) * u,
+        CGRectGetMinY(s) + MAX(K_PILL_Y * u, _layout.separated ? 14 : 0)
+    );
+
+    c = [self editorCenter:c key:key];
+    return CGRectMake(c.x - w / 2, c.y - h / 2, w, h);
+}
+
+- (CGPoint)menuCenter {
+    CGRect s = self.safe;
+    return CGPointMake(
+        CGRectGetMidX(s),
+        CGRectGetMinY(s) + MAX(K_PILL_Y * self.u, _layout.separated ? 14 : 0)
+    );
+}
+
+- (CGPoint)swapCenter {
+    CGRect s = self.safe;
+    CGPoint p = CGPointMake(
+        CGRectGetMidX(s),
+        CGRectGetMinY(s) + K_PILL_Y * self.u
+    );
+    return [self editorCenter:p key:@"swap"];
+}
 
 static CGFloat dist(CGPoint a, CGPoint b) { return hypot(a.x - b.x, a.y - b.y); }
 - (CGFloat)buttonDistance:(int)b point:(CGPoint)p {
@@ -329,7 +722,7 @@ static CGFloat dist(CGPoint a, CGPoint b) { return hypot(a.x - b.x, a.y - b.y); 
     int best = -1; CGFloat distance = 1;
     for (int i = 0; i < (int)(sizeof k_btns / sizeof *k_btns); i++) { int b = k_btns[i];
         if (fullOnly(b) && !_full) continue;
-        CGFloat d = [self buttonDistance:b point:p];
+CGFloat d = [self buttonDistance:b point:p];
         if (d <= 1 && (best < 0 || d < distance)) {
             best = b; distance = d;
             if (!_layout.separated) return b;
@@ -344,6 +737,8 @@ static CGFloat dist(CGPoint a, CGPoint b) { return hypot(a.x - b.x, a.y - b.y); 
     int hit = [self btnAt:p];
     return hit < 0 || d < [self buttonDistance:hit point:p];
 }
+
+- (BOOL)inSwap:(CGPoint)p { return dist(p, self.swapCenter) <= [self swapR] * 1.6; }
 - (uint64_t)faceAt:(CGPoint)p {   // keys under the finger in the diamond (between two keys both count)
     uint64_t m = 0; CGFloat r = self.faceHitR;
     for (int b = B_A; b <= B_Y; b++) if (dist(p, [self facePos:b]) <= r) m |= 1ull << b;
@@ -429,6 +824,7 @@ int front_web_touch(void);
     return v == self && front_web_touch() && ![self controlAt:p] ? nil : v;
 }
 - (void)touchesBegan:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
+    if (_editMode) { [self editorTouchesBegan:ts]; return; }
     BOOL game = NO;
     for (UITouch *t in ts) {
         if (_padOff) { game |= [self gameBegin:t]; continue; }
@@ -436,6 +832,7 @@ int front_web_touch(void);
         if (_layout.separated && !CGRectContainsPoint(_layout.controls, p)) { game |= [self gameBegin:t]; continue; }
         int hit = _tap ? -1 : [self btnAt:p];   // the menu button took its own touches (menuTakes)
         if (hit >= 0) { [_owner setObject:@(C_BTN | (uint64_t)hit << 8) forKey:t]; continue; }
+if ([self inSwap:p]) { [_owner setObject:@(C_SWAP) forKey:t]; _swapTouch = t; _swapBeganAt = CACurrentMediaTime(); continue; }
         if (_tap) { game |= [self gameBegin:t]; continue; }
         // diamond, D-pad, left stick: take the one with the smallest distance / grab radius, if it is <= 1
         CGFloat best = 1; int kind = C_NONE, idx = 0;
@@ -452,6 +849,7 @@ int front_web_touch(void);
     [self recompute];
 }
 - (void)touchesMoved:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e {
+    if (_editMode) { [self editorTouchesMoved:ts]; return; }
     BOOL game = NO;
     for (UITouch *t in ts) {
         uint64_t v = [_owner objectForKey:t].unsignedLongLongValue; int c = (int)(v & 0xff); CGPoint p = [t locationInView:self];
@@ -465,14 +863,23 @@ int front_web_touch(void);
     [self recompute];
 }
 - (void)endTouches:(NSSet<UITouch *> *)ts tapped:(BOOL)ended {
-    BOOL game = NO;
+if (_editMode) { [self editorTouchesEnded:ts commit:ended]; return; }
+    BOOL swap = NO, edit = NO, game = NO;
     for (UITouch *t in ts) {
         uint64_t v = [_owner objectForKey:t].unsignedLongLongValue;
+        if (ended && (v & 0xff) == C_SWAP) {
+            BOOL heldLong = (t == _swapTouch && CACurrentMediaTime() - _swapBeganAt >= 0.65);
+            if (heldLong) edit = YES;
+            else if ([self inSwap:[t locationInView:self]]) swap = YES;
+        }
+        if (t == _swapTouch) _swapTouch = nil;
         if ((v & 0xff) == C_GAME && (v >> 8) < 16) { _game[v >> 8] = nil; game = YES; }
         [_owner removeObjectForKey:t]; [_faceOf removeObjectForKey:t]; for (int i = 0; i < 2; i++) if (t == _stick[i]) _stick[i] = nil;
     }
     if (game) [self pushGame];
     [self recompute];
+if (edit) [self setEditorMode:YES];
+    else if (swap) [self nextLayout];
 }
 - (void)touchesEnded:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self endTouches:ts tapped:YES]; }
 - (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self endTouches:ts tapped:NO]; }
@@ -524,25 +931,27 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
             BOOL right = b == B_ZR || b == B_R; CGPoint c = [self dropCenter:b];
             setPath(_key[b], dropPath(c, [self dropR:b], right ? -M_PI_4 : -3 * M_PI_4, 4 * u)); placeLabel(_label[b], c, 16 * u);   // tip toward the near top corner
         } else if (isClick(b)) {
-            CGPoint c = [self clickCenter:b]; setPath(_key[b], circlePath(c, K_CLICK_R * u)); placeLabel(_label[b], c, 13 * u);
+            CGPoint c = [self clickCenter:b]; setPath(_key[b], circlePath(c, [self clickR:b])); placeLabel(_label[b], c, 13 * u * [self editorScale:(b == B_RS ? @"clickRS" : @"clickLS")]);
         } else {
             CGRect rc = [self pillRect:b];
             setPath(_key[b], CGPathCreateWithRoundedRect(rc, rc.size.height / 2, rc.size.height / 2, NULL)); placeLabel(_label[b], CGPointMake(CGRectGetMidX(rc), CGRectGetMidY(rc)), 18 * u);
         }
     }
     static const struct { int b; CGFloat angle; } arms[] = {{B_UP, 0}, {B_RIGHT, M_PI_2}, {B_DOWN, M_PI}, {B_LEFT, -M_PI_2}};   // the same arm in 90° steps
-    for (int i = 0; i < 4; i++) setPath(_key[arms[i].b], armPath(self.dpadCenter, self.dpadR, K_ARM_W * u, K_ARM_IN * u, arms[i].angle, 6 * u));
-    CGFloat mr = K_MENU_R * u; CGPoint mc = self.menuCenter;
+CGFloat ds = [self editorScale:@"dpad"]; for (int i = 0; i < 4; i++) setPath(_key[arms[i].b], armPath(self.dpadCenter, self.dpadR, K_ARM_W * u * ds, K_ARM_IN * u * ds, arms[i].angle, 6 * u * ds));
+    CGPoint sc = self.swapCenter; setPath(_swap, circlePath(sc, [self swapR])); placeLabel(_swapLabel, sc, 12 * u * [self editorScale:@"swap"]);
+CGFloat mr = K_MENU_R * u; CGPoint mc = self.menuCenter;
     _menu.frame = CGRectMake(mc.x - mr, mc.y - mr, 2 * mr, 2 * mr); _menu.layer.cornerRadius = mr;
     _menu.layer.shadowPath = [UIBezierPath bezierPathWithOvalInRect:_menu.bounds].CGPath;
     [_menu setImage:[UIImage systemImageNamed:@"gearshape.fill" withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:13 * u weight:UIImageSymbolWeightSemibold]] forState:UIControlStateNormal];
     setPath(_ring, circlePath(self.stickHome, [self stickR:0]));
-    CGFloat k = K_KNOB_R * u; _knob.bounds = CGRectMake(0, 0, 2 * k, 2 * k);
+    CGFloat k = K_KNOB_R * u * [self editorScale:@"stickL"]; _knob.bounds = CGRectMake(0, 0, 2 * k, 2 * k);
     setPath(_knob, circlePath(CGPointMake(k, k), k));
     CAShapeLayer *in = (CAShapeLayer *)_knob.sublayers.firstObject; CGPathRef ip = circlePath(CGPointMake(k, k), k * 0.62);
     in.frame = _knob.bounds; in.path = ip; CGPathRelease(ip);
     [CATransaction commit];
     [self refresh];
+    [self layoutEditorUI];
 }
 - (void)safeAreaInsetsDidChange { [super safeAreaInsetsDidChange]; [self setNeedsLayout]; }
 - (void)refresh {   // pressed state → fill, sticks → knob position
@@ -625,7 +1034,7 @@ static BOOL pads_slotted(GCController *gone) {
     GCController *c = note.object, *gone = [note.name isEqual:GCControllerDidDisconnectNotification] ? c : nil;
     if (c && (!c.extendedGamepad || g_merge)) LOG("controller %s: %s%s", gone ? "disconnected" : "connected", pad_name(c), c.extendedGamepad ? "" : " (no extended gamepad profile: not used)");
     BOOL any = g_merge ? pads_merged(gone) : pads_slotted(gone);
-    dispatch_async(dispatch_get_main_queue(), ^{ self->_padOff = any; self->_controls.hidden = any; [self reset]; });   // the touch gamepad hides while any controller is in use
+    dispatch_async(dispatch_get_main_queue(), ^{ if (any && self->_editMode) [self setEditorMode:NO]; self->_padOff = any; self->_controls.hidden = any; [self reset]; });   // the touch gamepad hides while any controller is in use
 }
 @end
 
